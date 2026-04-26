@@ -50,7 +50,7 @@ CONFIG = {
     "sl_atr_mult"    : 1.5,
     "tp_atr_mult"    : 3.0,
     "risk_pct"       : 0.02,
-    "testnet"        : True,
+    "testnet"        : False,
     "loop_seconds"   : 60,
     "heartbeat_ciclos": 60,   # cada 60 ciclos (~1h) manda resumen
 }
