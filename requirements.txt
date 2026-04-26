@@ -1,4 +1,4 @@
 python-binance==1.0.19
-pandas==2.2.2
-pandas-ta==0.3.14b
+pandas
+pandas-ta
 requests==2.32.3
