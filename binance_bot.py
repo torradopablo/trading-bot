@@ -40,7 +40,7 @@ TG_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID",   "")   # 123456789
 CONFIG = {
     "symbol"         : "BTCUSDT",
     "interval"       : Client.KLINE_INTERVAL_15MINUTE,
-    "leverage"       : 3,
+    "leverage"       : 2,
     "ema_fast"       : 9,
     "ema_slow"       : 21,
     "rsi_period"     : 14,
