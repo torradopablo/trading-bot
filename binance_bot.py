@@ -40,7 +40,7 @@ TG_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID",   "")   # 123456789
 CONFIG = {
     "symbol"         : "BTCUSDT",
     "interval"       : Client.KLINE_INTERVAL_15MINUTE,
-    "leverage"       : 2,
+    "leverage"       : 3,
     "ema_fast"       : 9,
     "ema_slow"       : 21,
     "rsi_period"     : 14,
@@ -221,11 +221,22 @@ def get_open_position(client: Client) -> dict | None:
     return None
 
 
-def calc_qty(client: Client, atr: float) -> float:
+def calc_qty(client: Client, atr: float, price: float) -> float:
     balance   = get_balance(client)
     risk_usdt = balance * CONFIG["risk_pct"]
     stop_dist = atr * CONFIG["sl_atr_mult"]
-    return round((risk_usdt * CONFIG["leverage"]) / stop_dist, 3)
+    
+    # 1. Cantidad teórica según riesgo (pérdida = qty * stop_dist)
+    qty_risk = risk_usdt / stop_dist
+    
+    # 2. Cantidad máxima posible según margen disponible
+    # Usamos 95% del poder de compra para evitar rechazo por comisiones de apertura
+    max_notional = balance * CONFIG["leverage"] * 0.95
+    qty_max = max_notional / price
+    
+    final_qty = min(qty_risk, qty_max)
+    
+    return round(final_qty, 3)
 
 
 def set_leverage(client: Client):
@@ -239,7 +250,14 @@ def set_leverage(client: Client):
 
 def open_position(client: Client, signal: str, price: float, atr: float):
     symbol  = CONFIG["symbol"]
-    qty     = calc_qty(client, atr)
+    qty     = calc_qty(client, atr, price)
+    
+    if qty <= 0:
+        msg = f"Margen o riesgo insuficiente para abrir posición (qty={qty})."
+        log.warning(msg)
+        tg_error(msg)
+        return
+        
     sl_dist = atr * CONFIG["sl_atr_mult"]
     tp_dist = atr * CONFIG["tp_atr_mult"]
 
