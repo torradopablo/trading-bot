@@ -5,12 +5,6 @@ Notificaciones: Telegram Bot
 
 Dependencias:
     pip install python-binance pandas pandas-ta requests
-
-Cómo crear el bot de Telegram:
-    1. Abrí Telegram y buscá @BotFather
-    2. Enviá /newbot → seguí los pasos → copiá el TOKEN
-    3. Buscá @userinfobot o @RawDataBot → te da tu CHAT_ID
-    4. Pegá ambos en el .env (ver .env.example)
 """
 
 import os
@@ -30,29 +24,29 @@ pathlib.Path("logs").mkdir(exist_ok=True)
 
 # ─── CREDENCIALES ────────────────────────────────────────────────────────────
 
-API_KEY       = os.getenv("BINANCE_API_KEY",    "TU_API_KEY_AQUI")
-API_SECRET    = os.getenv("BINANCE_API_SECRET", "TU_API_SECRET_AQUI")
-TG_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN", "")   # 7123456789:AAFxxx...
-TG_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID",   "")   # 123456789
+API_KEY    = os.getenv("BINANCE_API_KEY",    "TU_API_KEY_AQUI")
+API_SECRET = os.getenv("BINANCE_API_SECRET", "TU_API_SECRET_AQUI")
+TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID",   "")
 
 # ─── PARÁMETROS ──────────────────────────────────────────────────────────────
 
 CONFIG = {
-    "symbol"         : "BTCUSDT",
-    "interval"       : Client.KLINE_INTERVAL_15MINUTE,
-    "leverage"       : 3,
-    "ema_fast"       : 9,
-    "ema_slow"       : 21,
-    "rsi_period"     : 14,
-    "rsi_overbought" : 70,
-    "rsi_oversold"   : 30,
-    "atr_period"     : 14,
-    "sl_atr_mult"    : 1.5,
-    "tp_atr_mult"    : 3.0,
-    "risk_pct"       : 0.02,
-    "testnet"        : False,
-    "loop_seconds"   : 60,
-    "heartbeat_ciclos": 60,   # cada 60 ciclos (~1h) manda resumen
+    "symbol"          : "BTCUSDT",
+    "interval"        : Client.KLINE_INTERVAL_15MINUTE,
+    "leverage"        : 3,
+    "ema_fast"        : 9,
+    "ema_slow"        : 21,
+    "rsi_period"      : 14,
+    "rsi_overbought"  : 70,
+    "rsi_oversold"    : 30,
+    "atr_period"      : 14,
+    "sl_atr_mult"     : 1.5,
+    "tp_atr_mult"     : 3.0,
+    "risk_pct"        : 0.02,
+    "testnet"         : False,
+    "loop_seconds"    : 60,
+    "heartbeat_ciclos": 60,
 }
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
@@ -73,7 +67,6 @@ log = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def tg_send(text: str):
-    """Envía mensaje de Telegram. Silencioso si no hay token configurado."""
     if not TG_TOKEN or not TG_CHAT_ID:
         return
     try:
@@ -105,17 +98,15 @@ def tg_bot_iniciado():
 def tg_orden_abierta(signal: str, price: float, qty: float,
                      sl: float, tp: float, balance: float):
     if signal == "LONG":
-        emoji     = "🟢"
-        direccion = "LONG  ▲"
+        emoji      = "🟢"
+        direccion  = "LONG  ▲"
         riesgo_pct = round(abs(price - sl) / price * 100 * CONFIG["leverage"], 2)
     else:
-        emoji     = "🔴"
-        direccion = "SHORT ▼"
+        emoji      = "🔴"
+        direccion  = "SHORT ▼"
         riesgo_pct = round(abs(sl - price) / price * 100 * CONFIG["leverage"], 2)
-
     tp_pct = round(abs(tp - price) / price * 100 * CONFIG["leverage"], 2)
     now    = datetime.now().strftime("%H:%M:%S")
-
     tg_send(
         f"{emoji} <b>ORDEN ABIERTA — {direccion}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -130,11 +121,10 @@ def tg_orden_abierta(signal: str, price: float, qty: float,
 
 
 def tg_orden_cerrada(motivo: str, pnl: float | None = None):
-    emoji_pnl = ""
-    pnl_txt   = ""
+    pnl_txt = ""
     if pnl is not None:
         emoji_pnl = "🟢" if pnl >= 0 else "🔴"
-        pnl_txt   = f"\n{emoji_pnl} PnL no realizado: <code>${pnl:+.2f} USDT</code>"
+        pnl_txt   = f"\n{emoji_pnl} PnL: <code>${pnl:+.2f} USDT</code>"
     now = datetime.now().strftime("%H:%M:%S")
     tg_send(
         f"⚪ <b>POSICIÓN CERRADA</b>\n"
@@ -188,9 +178,8 @@ def get_klines(client: Client) -> pd.DataFrame:
         "open_time","open","high","low","close","volume",
         "close_time","qav","trades","tbbav","tbqav","ignore"
     ])
-    for col in ["close","high","low"]:
+    for col in ["close", "high", "low"]:
         df[col] = df[col].astype(float)
-
     df["ema_fast"] = ta.ema(df["close"], length=CONFIG["ema_fast"])
     df["ema_slow"] = ta.ema(df["close"], length=CONFIG["ema_slow"])
     df["rsi"]      = ta.rsi(df["close"], length=CONFIG["rsi_period"])
@@ -221,21 +210,27 @@ def get_open_position(client: Client) -> dict | None:
     return None
 
 
+def cancel_open_orders(client: Client):
+    """Cancela todas las órdenes abiertas del símbolo (limpia SL/TP huérfanos)."""
+    try:
+        client.futures_cancel_all_open_orders(symbol=CONFIG["symbol"])
+        log.info("Órdenes abiertas canceladas")
+    except BinanceAPIException as e:
+        log.warning(f"No se pudieron cancelar órdenes: {e}")
+
+
 def calc_qty(client: Client, atr: float, price: float) -> float:
     balance   = get_balance(client)
     risk_usdt = balance * CONFIG["risk_pct"]
     stop_dist = atr * CONFIG["sl_atr_mult"]
-    
-    # 1. Cantidad teórica según riesgo (pérdida = qty * stop_dist)
+
+    # Cantidad según riesgo
     qty_risk = risk_usdt / stop_dist
-    
-    # 2. Cantidad máxima posible según margen disponible
-    # Usamos 95% del poder de compra para evitar rechazo por comisiones de apertura
-    max_notional = balance * CONFIG["leverage"] * 0.95
-    qty_max = max_notional / price
-    
+
+    # Cantidad máxima según margen (95% para cubrir comisiones)
+    qty_max = (balance * CONFIG["leverage"] * 0.95) / price
+
     final_qty = min(qty_risk, qty_max)
-    
     return round(final_qty, 3)
 
 
@@ -244,20 +239,24 @@ def set_leverage(client: Client):
         client.futures_change_leverage(
             symbol=CONFIG["symbol"], leverage=CONFIG["leverage"]
         )
+        log.info(f"Leverage {CONFIG['leverage']}x configurado")
     except BinanceAPIException:
         pass
 
 
 def open_position(client: Client, signal: str, price: float, atr: float):
-    symbol  = CONFIG["symbol"]
-    qty     = calc_qty(client, atr, price)
-    
+    symbol = CONFIG["symbol"]
+    qty    = calc_qty(client, atr, price)
+
     if qty <= 0:
-        msg = f"Margen o riesgo insuficiente para abrir posición (qty={qty})."
+        msg = f"Cantidad inválida (qty={qty}), posición no abierta"
         log.warning(msg)
         tg_error(msg)
         return
-        
+
+    # Cancelar cualquier orden SL/TP huérfana antes de abrir
+    cancel_open_orders(client)
+
     sl_dist = atr * CONFIG["sl_atr_mult"]
     tp_dist = atr * CONFIG["tp_atr_mult"]
 
@@ -273,26 +272,59 @@ def open_position(client: Client, signal: str, price: float, atr: float):
     log.info(f"Abriendo {signal} qty={qty} entry={price:.2f} SL={sl_price:.2f} TP={tp_price:.2f}")
 
     try:
-        client.futures_create_order(
-            symbol=symbol, side=side, type=ORDER_TYPE_MARKET, quantity=qty
+        # 1. Orden de entrada a mercado
+        entry = client.futures_create_order(
+            symbol=symbol,
+            side=side,
+            type=ORDER_TYPE_MARKET,
+            quantity=qty
         )
+        log.info(f"Entrada ejecutada: {entry.get('orderId')}")
+
+        # Pequeña pausa para que Binance registre la posición
+        time.sleep(1)
+
+        # Obtener cantidad real ejecutada (puede diferir levemente)
+        pos = get_open_position(client)
+        real_qty = abs(float(pos["positionAmt"])) if pos else qty
+
+        # 2. Stop Loss — usando quantity explícita y reduceOnly
         client.futures_create_order(
-            symbol=symbol, side=close_side,
+            symbol=symbol,
+            side=close_side,
             type=FUTURE_ORDER_TYPE_STOP_MARKET,
-            stopPrice=str(sl_price), closePosition=True
+            stopPrice=str(sl_price),
+            quantity=real_qty,
+            reduceOnly=True,
+            timeInForce=TIME_IN_FORCE_GTC
         )
+        log.info(f"SL colocado en {sl_price}")
+
+        # 3. Take Profit — usando quantity explícita y reduceOnly
         client.futures_create_order(
-            symbol=symbol, side=close_side,
+            symbol=symbol,
+            side=close_side,
             type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
-            stopPrice=str(tp_price), closePosition=True
+            stopPrice=str(tp_price),
+            quantity=real_qty,
+            reduceOnly=True,
+            timeInForce=TIME_IN_FORCE_GTC
         )
+        log.info(f"TP colocado en {tp_price}")
+
         balance = get_balance(client)
-        log.info(f"Posición {signal} abierta OK")
-        tg_orden_abierta(signal, price, qty, sl_price, tp_price, balance)
+        log.info(f"Posición {signal} abierta OK con SL y TP")
+        tg_orden_abierta(signal, price, real_qty, sl_price, tp_price, balance)
 
     except BinanceAPIException as e:
         log.error(f"Error abriendo posición: {e}")
         tg_error(f"Error abriendo {signal}: {e}")
+        # Si la entrada se ejecutó pero SL/TP fallaron, intentar cerrar
+        pos = get_open_position(client)
+        if pos:
+            log.warning("Entrada ejecutada pero SL/TP fallaron — cerrando posición por seguridad")
+            tg_error("Entrada sin SL/TP — cerrando posición por seguridad")
+            close_position(client, "fallo en SL/TP")
 
 
 def close_position(client: Client, motivo: str = "señal inversa"):
@@ -302,11 +334,17 @@ def close_position(client: Client, motivo: str = "señal inversa"):
     amt  = float(pos["positionAmt"])
     pnl  = float(pos.get("unrealizedProfit", 0))
     side = SIDE_SELL if amt > 0 else SIDE_BUY
+
     try:
+        # Cancelar SL/TP antes de cerrar para evitar doble ejecución
+        cancel_open_orders(client)
+
         client.futures_create_order(
-            symbol=CONFIG["symbol"], side=side,
+            symbol=CONFIG["symbol"],
+            side=side,
             type=ORDER_TYPE_MARKET,
-            quantity=abs(amt), reduceOnly=True
+            quantity=abs(amt),
+            reduceOnly=True
         )
         log.info(f"Posición cerrada | motivo={motivo} | PnL={pnl:+.2f}")
         tg_orden_cerrada(motivo, pnl)
