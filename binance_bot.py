@@ -14,6 +14,7 @@ Dependencias:
 import os
 import time
 import logging
+from logging.handlers import RotatingFileHandler
 import pathlib
 import requests
 from datetime import datetime
@@ -52,7 +53,7 @@ CONFIG = {
     "risk_pct"        : 0.02,
     "testnet"         : False,
     "loop_seconds"    : 15,   # más frecuente para monitorear SL/TP
-    "heartbeat_ciclos": 240,  # cada 240 ciclos × 15s = ~1h
+    "heartbeat_ciclos": 80,   # cada 80 ciclos × 15s = ~20min
 }
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
@@ -61,7 +62,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[
-        logging.FileHandler("logs/bot.log"),
+        RotatingFileHandler("logs/bot.log", maxBytes=5*1024*1024, backupCount=3),
         logging.StreamHandler()
     ]
 )
@@ -74,6 +75,7 @@ state = {
     "tp_price"   : None,
     "signal"     : None,   # "LONG" o "SHORT"
     "entry_price": None,
+    "entry_time" : None,   # datetime de apertura
     "sl_order_id": None,   # orderId de la orden SL en Binance
     "tp_order_id": None,   # orderId de la orden TP en Binance
 }
@@ -149,16 +151,18 @@ def tg_orden_cerrada(motivo: str, pnl: float | None = None):
 
 
 def tg_heartbeat(price: float, ema_f: float, ema_s: float,
-                 rsi: float, pos_txt: str, balance: float):
+                 rsi: float, atr: float, pos_txt: str,
+                 balance_available: float, balance_total: float):
     now = datetime.now().strftime("%d/%m %H:%M")
     tg_send(
-        f"📊 <b>Resumen horario</b>  <i>{now}</i>\n"
+        f"📊 <b>Resumen 20min</b>  <i>{now}</i>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"💵 Precio: <b>${price:,.2f}</b>\n"
         f"📈 EMA9: <code>{ema_f}</code>  EMA21: <code>{ema_s}</code>\n"
-        f"📉 RSI: <code>{rsi}</code>\n"
+        f"📉 RSI: <code>{rsi}</code>  ATR: <code>{atr}</code>\n"
         f"📂 Posición: {pos_txt}\n"
-        f"💰 Balance: <code>${balance:,.2f} USDT</code>"
+        f"💰 Disponible: <code>${balance_available:,.2f}</code>\n"
+        f"💼 Total: <code>${balance_total:,.2f} USDT</code>"
     )
 
 
@@ -233,6 +237,13 @@ def get_balance(client: Client) -> float:
     return 0.0
 
 
+def get_total_balance(client: Client) -> float:
+    for a in client.futures_account_balance():
+        if a["asset"] == "USDT":
+            return float(a["balance"])
+    return 0.0
+
+
 def get_open_position(client: Client) -> dict | None:
     for p in client.futures_position_information(symbol=CONFIG["symbol"]):
         if float(p["positionAmt"]) != 0:
@@ -264,6 +275,7 @@ def clear_state():
     state["tp_price"]    = None
     state["signal"]      = None
     state["entry_price"] = None
+    state["entry_time"]  = None
     state["sl_order_id"] = None
     state["tp_order_id"] = None
 
@@ -356,6 +368,7 @@ def open_position(client: Client, signal: str, price: float, atr: float):
         state["tp_price"]    = tp_price
         state["signal"]      = signal
         state["entry_price"] = price
+        state["entry_time"]  = datetime.now()
         state["sl_order_id"] = sl_id
         state["tp_order_id"] = tp_id
 
@@ -477,13 +490,16 @@ def run():
         log.warning("Cerrando posición previa para empezar limpio.")
         close_position(client, "reinicio del bot")
 
-    ciclo = 0
+    ciclo_heartbeat = 0
     # Separar contador de señales del de precio (precio cada 15s, señal cada 60s)
     ciclos_senal = 0
     CICLOS_POR_SENAL = max(1, 60 // CONFIG["loop_seconds"])  # cada 60s revisar señal
+    errores_consecutivos = 0
+    MAX_ERRORES_RECONEXION = 5
 
     # Inicializar variables para que heartbeat no falle en primeros ciclos
-    price = ema_f = ema_s = rsi = 0
+    price = ema_f = ema_s = rsi = atr_val = 0
+    indicadores_listos = False
 
     while True:
         try:
@@ -492,6 +508,9 @@ def run():
 
             # ── Leer posición una sola vez por ciclo ────────────────────────
             pos = get_open_position(client)
+
+            # Reset contador de errores tras ciclo exitoso
+            errores_consecutivos = 0
 
             # ── Verificar SL/TP si hay posición ─────────────────────────────
             if pos and state["sl_price"] is not None:
@@ -515,18 +534,19 @@ def run():
             ciclos_senal += 1
             if ciclos_senal >= CICLOS_POR_SENAL:
                 ciclos_senal = 0
-                df    = get_klines(client)
-                price = float(df.iloc[-1]["close"])
-                atr   = float(df.iloc[-1]["atr"])
-                ema_f = round(float(df.iloc[-1]["ema_fast"]), 2)
-                ema_s = round(float(df.iloc[-1]["ema_slow"]), 2)
-                rsi   = round(float(df.iloc[-1]["rsi"]), 1)
-                signal = check_signal(df)
+                df      = get_klines(client)
+                price   = float(df.iloc[-1]["close"])
+                atr_val = float(df.iloc[-1]["atr"])
+                ema_f   = round(float(df.iloc[-1]["ema_fast"]), 2)
+                ema_s   = round(float(df.iloc[-1]["ema_slow"]), 2)
+                rsi     = round(float(df.iloc[-1]["rsi"]), 1)
+                signal  = check_signal(df)
+                indicadores_listos = True
 
-                log.info(f"BTC=${price:.2f} | EMA9={ema_f} EMA21={ema_s} | RSI={rsi} | ATR={atr:.2f} | {signal}")
+                log.info(f"BTC=${price:.2f} | EMA9={ema_f} EMA21={ema_s} | RSI={rsi} | ATR={atr_val:.2f} | {signal}")
 
                 if signal != "NONE" and pos is None:
-                    open_position(client, signal, price, atr)
+                    open_position(client, signal, price, atr_val)
                     pos = get_open_position(client)  # actualizar tras apertura
 
                 elif signal != "NONE" and pos is not None:
@@ -537,31 +557,53 @@ def run():
                         time.sleep(2)
                         # Usar precio fresco para la nueva entrada
                         fresh_price = get_current_price(client)
-                        open_position(client, signal, fresh_price, atr)
+                        open_position(client, signal, fresh_price, atr_val)
                         pos = get_open_position(client)
 
-                # Heartbeat horario (usa pos actualizado)
-                ciclo += 1
-                if ciclo >= CONFIG["heartbeat_ciclos"]:
-                    balance = get_balance(client)
-                    if pos:
-                        amt       = float(pos["positionAmt"])
-                        pnl       = float(pos.get("unrealizedProfit", 0))
-                        direccion = "LONG 🟢" if amt > 0 else "SHORT 🔴"
-                        sl_txt    = f"SL: ${state['sl_price']:,.0f}" if state["sl_price"] else "—"
-                        tp_txt    = f"TP: ${state['tp_price']:,.0f}" if state["tp_price"] else "—"
-                        pos_txt   = f"{direccion} | PnL: <code>${pnl:+.2f}</code>\n{sl_txt} · {tp_txt}"
-                    else:
-                        pos_txt = "Sin posición abierta"
-                    tg_heartbeat(price, ema_f, ema_s, rsi, pos_txt, balance)
-                    ciclo = 0
+            # ── Heartbeat cada N ciclos reales (80 × 15s = 20min) ────────
+            ciclo_heartbeat += 1
+            if ciclo_heartbeat >= CONFIG["heartbeat_ciclos"] and indicadores_listos:
+                bal_available = get_balance(client)
+                bal_total     = get_total_balance(client)
+                if pos:
+                    amt       = float(pos["positionAmt"])
+                    pnl       = float(pos.get("unrealizedProfit", 0))
+                    direccion = "LONG 🟢" if amt > 0 else "SHORT 🔴"
+                    sl_txt    = f"SL: ${state['sl_price']:,.0f}" if state["sl_price"] else "—"
+                    tp_txt    = f"TP: ${state['tp_price']:,.0f}" if state["tp_price"] else "—"
+                    # Duración de la posición
+                    dur_txt   = ""
+                    if state["entry_time"]:
+                        delta   = datetime.now() - state["entry_time"]
+                        horas   = int(delta.total_seconds() // 3600)
+                        minutos = int((delta.total_seconds() % 3600) // 60)
+                        dur_txt = f"\n⏱ Duración: {horas}h {minutos}m"
+                    pos_txt   = f"{direccion} | PnL: <code>${pnl:+.2f}</code>\n{sl_txt} · {tp_txt}{dur_txt}"
+                else:
+                    pos_txt = "Sin posición abierta"
+                tg_heartbeat(price, ema_f, ema_s, rsi,
+                             round(atr_val, 2), pos_txt,
+                             bal_available, bal_total)
+                ciclo_heartbeat = 0
 
         except BinanceAPIException as e:
             log.error(f"Binance API error: {e}")
             tg_error(str(e))
+            errores_consecutivos += 1
         except Exception as e:
             log.error(f"Error inesperado: {e}")
             tg_error(str(e))
+            errores_consecutivos += 1
+
+        # Reconectar si hay muchos errores seguidos
+        if errores_consecutivos >= MAX_ERRORES_RECONEXION:
+            log.warning(f"{errores_consecutivos} errores consecutivos — reconectando cliente Binance")
+            tg_error(f"Reconectando tras {errores_consecutivos} errores consecutivos")
+            try:
+                client = get_client()
+                errores_consecutivos = 0
+            except Exception as reconn_err:
+                log.error(f"Error reconectando: {reconn_err}")
 
         time.sleep(CONFIG["loop_seconds"])
 
