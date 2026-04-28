@@ -3,6 +3,9 @@ Binance Futures Bot — EMA 9/21 + RSI 14 + ATR Stop Loss
 Mercado: BTCUSDT Futures | Apalancamiento: 3x | Temporalidad: 15m
 Notificaciones: Telegram Bot
 
+SL/TP implementados con STOP y TAKE_PROFIT (con precio límite)
+compatibles con todas las cuentas Binance Futures.
+
 Dependencias:
     pip install python-binance pandas pandas-ta requests
 """
@@ -47,6 +50,8 @@ CONFIG = {
     "testnet"         : False,
     "loop_seconds"    : 60,
     "heartbeat_ciclos": 60,
+    # Slippage para precio límite del SL (0.1% más holgado para que ejecute)
+    "sl_limit_slippage": 0.001,
 }
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
@@ -211,7 +216,6 @@ def get_open_position(client: Client) -> dict | None:
 
 
 def cancel_open_orders(client: Client):
-    """Cancela todas las órdenes abiertas del símbolo (limpia SL/TP huérfanos)."""
     try:
         client.futures_cancel_all_open_orders(symbol=CONFIG["symbol"])
         log.info("Órdenes abiertas canceladas")
@@ -223,15 +227,9 @@ def calc_qty(client: Client, atr: float, price: float) -> float:
     balance   = get_balance(client)
     risk_usdt = balance * CONFIG["risk_pct"]
     stop_dist = atr * CONFIG["sl_atr_mult"]
-
-    # Cantidad según riesgo
-    qty_risk = risk_usdt / stop_dist
-
-    # Cantidad máxima según margen (95% para cubrir comisiones)
-    qty_max = (balance * CONFIG["leverage"] * 0.95) / price
-
-    final_qty = min(qty_risk, qty_max)
-    return round(final_qty, 3)
+    qty_risk  = risk_usdt / stop_dist
+    qty_max   = (balance * CONFIG["leverage"] * 0.95) / price
+    return round(min(qty_risk, qty_max), 3)
 
 
 def set_leverage(client: Client):
@@ -244,6 +242,61 @@ def set_leverage(client: Client):
         pass
 
 
+def place_sl_tp(client: Client, close_side: str, qty: float,
+                sl_price: float, tp_price: float, signal: str):
+    """
+    Coloca SL y TP usando órdenes STOP (con precio límite) y TAKE_PROFIT
+    (con precio límite). Compatibles con todas las cuentas Binance Futures.
+
+    Para LONG:
+      SL = STOP sell:        stopPrice = sl,  price = sl * (1 - slippage)
+      TP = TAKE_PROFIT sell: stopPrice = tp,  price = tp * (1 - slippage)
+
+    Para SHORT:
+      SL = STOP buy:         stopPrice = sl,  price = sl * (1 + slippage)
+      TP = TAKE_PROFIT buy:  stopPrice = tp,  price = tp * (1 + slippage)
+
+    El slippage en el precio límite asegura que la orden se ejecute incluso
+    con pequeños gaps de precio, sin convertirse en market.
+    """
+    slip = CONFIG["sl_limit_slippage"]
+
+    if signal == "LONG":
+        sl_limit = round(sl_price * (1 - slip), 2)
+        tp_limit = round(tp_price * (1 - slip), 2)
+    else:
+        sl_limit = round(sl_price * (1 + slip), 2)
+        tp_limit = round(tp_price * (1 + slip), 2)
+
+    # ── Stop Loss ──────────────────────────────────────────────────────
+    client.futures_create_order(
+        symbol        = CONFIG["symbol"],
+        side          = close_side,
+        type          = "STOP",                  # STOP con precio límite
+        quantity      = qty,
+        price         = str(sl_limit),           # precio límite de ejecución
+        stopPrice     = str(sl_price),           # precio trigger
+        reduceOnly    = True,
+        timeInForce   = TIME_IN_FORCE_GTC,
+        workingType   = "MARK_PRICE",            # trigger por Mark Price (más estable)
+    )
+    log.info(f"SL colocado — trigger={sl_price} límite={sl_limit}")
+
+    # ── Take Profit ────────────────────────────────────────────────────
+    client.futures_create_order(
+        symbol        = CONFIG["symbol"],
+        side          = close_side,
+        type          = "TAKE_PROFIT",           # TAKE_PROFIT con precio límite
+        quantity      = qty,
+        price         = str(tp_limit),           # precio límite de ejecución
+        stopPrice     = str(tp_price),           # precio trigger
+        reduceOnly    = True,
+        timeInForce   = TIME_IN_FORCE_GTC,
+        workingType   = "MARK_PRICE",
+    )
+    log.info(f"TP colocado — trigger={tp_price} límite={tp_limit}")
+
+
 def open_position(client: Client, signal: str, price: float, atr: float):
     symbol = CONFIG["symbol"]
     qty    = calc_qty(client, atr, price)
@@ -254,7 +307,6 @@ def open_position(client: Client, signal: str, price: float, atr: float):
         tg_error(msg)
         return
 
-    # Cancelar cualquier orden SL/TP huérfana antes de abrir
     cancel_open_orders(client)
 
     sl_dist = atr * CONFIG["sl_atr_mult"]
@@ -274,43 +326,22 @@ def open_position(client: Client, signal: str, price: float, atr: float):
     try:
         # 1. Orden de entrada a mercado
         entry = client.futures_create_order(
-            symbol=symbol,
-            side=side,
-            type=ORDER_TYPE_MARKET,
-            quantity=qty
+            symbol   = symbol,
+            side     = side,
+            type     = ORDER_TYPE_MARKET,
+            quantity = qty
         )
-        log.info(f"Entrada ejecutada: {entry.get('orderId')}")
+        log.info(f"Entrada ejecutada: orderId={entry.get('orderId')}")
 
-        # Pequeña pausa para que Binance registre la posición
+        # Pausa para que Binance registre la posición
         time.sleep(1)
 
-        # Obtener cantidad real ejecutada (puede diferir levemente)
-        pos = get_open_position(client)
+        # Cantidad real ejecutada
+        pos      = get_open_position(client)
         real_qty = abs(float(pos["positionAmt"])) if pos else qty
 
-        # 2. Stop Loss — usando quantity explícita y reduceOnly
-        client.futures_create_order(
-            symbol=symbol,
-            side=close_side,
-            type=FUTURE_ORDER_TYPE_STOP_MARKET,
-            stopPrice=str(sl_price),
-            quantity=real_qty,
-            reduceOnly=True,
-            timeInForce=TIME_IN_FORCE_GTC
-        )
-        log.info(f"SL colocado en {sl_price}")
-
-        # 3. Take Profit — usando quantity explícita y reduceOnly
-        client.futures_create_order(
-            symbol=symbol,
-            side=close_side,
-            type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
-            stopPrice=str(tp_price),
-            quantity=real_qty,
-            reduceOnly=True,
-            timeInForce=TIME_IN_FORCE_GTC
-        )
-        log.info(f"TP colocado en {tp_price}")
+        # 2. SL + TP
+        place_sl_tp(client, close_side, real_qty, sl_price, tp_price, signal)
 
         balance = get_balance(client)
         log.info(f"Posición {signal} abierta OK con SL y TP")
@@ -319,11 +350,11 @@ def open_position(client: Client, signal: str, price: float, atr: float):
     except BinanceAPIException as e:
         log.error(f"Error abriendo posición: {e}")
         tg_error(f"Error abriendo {signal}: {e}")
-        # Si la entrada se ejecutó pero SL/TP fallaron, intentar cerrar
+        # Si la entrada se ejecutó pero SL/TP fallaron → cerrar por seguridad
         pos = get_open_position(client)
         if pos:
-            log.warning("Entrada ejecutada pero SL/TP fallaron — cerrando posición por seguridad")
-            tg_error("Entrada sin SL/TP — cerrando posición por seguridad")
+            log.warning("Entrada ejecutada pero SL/TP fallaron — cerrando por seguridad")
+            tg_error("Entrada sin SL/TP — cerrando por seguridad")
             close_position(client, "fallo en SL/TP")
 
 
@@ -336,15 +367,13 @@ def close_position(client: Client, motivo: str = "señal inversa"):
     side = SIDE_SELL if amt > 0 else SIDE_BUY
 
     try:
-        # Cancelar SL/TP antes de cerrar para evitar doble ejecución
         cancel_open_orders(client)
-
         client.futures_create_order(
-            symbol=CONFIG["symbol"],
-            side=side,
-            type=ORDER_TYPE_MARKET,
-            quantity=abs(amt),
-            reduceOnly=True
+            symbol     = CONFIG["symbol"],
+            side       = side,
+            type       = ORDER_TYPE_MARKET,
+            quantity   = abs(amt),
+            reduceOnly = True
         )
         log.info(f"Posición cerrada | motivo={motivo} | PnL={pnl:+.2f}")
         tg_orden_cerrada(motivo, pnl)
