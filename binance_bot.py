@@ -3,7 +3,8 @@ Binance Futures Bot — EMA 9/21 + RSI 14 + ATR Stop Loss
 Mercado: BTCUSDT Futures | Apalancamiento: 3x | Temporalidad: 15m
 Notificaciones: Telegram Bot
 
-SL y TP manejados por el bot (sin órdenes condicionales de Binance).
+SL/TP: órdenes reales STOP_MARKET + TAKE_PROFIT_MARKET en Binance
+(endpoint estándar /fapi/v1/order) + monitoreo software como respaldo.
 Compatible con todas las cuentas Binance Futures.
 
 Dependencias:
@@ -67,10 +68,12 @@ log = logging.getLogger(__name__)
 # ─── ESTADO INTERNO (SL/TP en memoria) ───────────────────────────────────────
 
 state = {
-    "sl_price"  : None,
-    "tp_price"  : None,
-    "signal"    : None,   # "LONG" o "SHORT"
+    "sl_price"   : None,
+    "tp_price"   : None,
+    "signal"     : None,   # "LONG" o "SHORT"
     "entry_price": None,
+    "sl_order_id": None,   # orderId de la orden SL en Binance
+    "tp_order_id": None,   # orderId de la orden TP en Binance
 }
 
 
@@ -246,6 +249,49 @@ def clear_state():
     state["tp_price"]    = None
     state["signal"]      = None
     state["entry_price"] = None
+    state["sl_order_id"] = None
+    state["tp_order_id"] = None
+
+
+def cancel_open_orders(client: Client):
+    try:
+        client.futures_cancel_all_open_orders(symbol=CONFIG["symbol"])
+        log.info("Órdenes condicionales canceladas")
+    except BinanceAPIException as e:
+        log.warning(f"No se pudieron cancelar órdenes: {e}")
+
+
+def place_sl_tp(client: Client, close_side: str,
+                sl_price: float, tp_price: float):
+    """
+    Coloca órdenes reales de SL y TP en Binance usando STOP_MARKET y
+    TAKE_PROFIT_MARKET, que son aceptadas por el endpoint estándar
+    /fapi/v1/order (sin error -4120).
+
+    closePosition=True  → Binance cierra toda la posición al dispararse.
+    workingType=MARK_PRICE → trigger por Mark Price (evita wick-outs).
+    """
+    sl_order = client.futures_create_order(
+        symbol        = CONFIG["symbol"],
+        side          = close_side,
+        type          = "STOP_MARKET",
+        stopPrice     = str(sl_price),
+        closePosition = True,
+        workingType   = "MARK_PRICE",
+    )
+    log.info(f"SL colocado en Binance — trigger={sl_price} id={sl_order['orderId']}")
+
+    tp_order = client.futures_create_order(
+        symbol        = CONFIG["symbol"],
+        side          = close_side,
+        type          = "TAKE_PROFIT_MARKET",
+        stopPrice     = str(tp_price),
+        closePosition = True,
+        workingType   = "MARK_PRICE",
+    )
+    log.info(f"TP colocado en Binance — trigger={tp_price} id={tp_order['orderId']}")
+
+    return sl_order["orderId"], tp_order["orderId"]
 
 
 def open_position(client: Client, signal: str, price: float, atr: float):
@@ -273,7 +319,7 @@ def open_position(client: Client, signal: str, price: float, atr: float):
     log.info(f"Abriendo {signal} qty={qty} entry={price:.2f} SL={sl_price:.2f} TP={tp_price:.2f}")
 
     try:
-        # Única orden necesaria: entrada a mercado
+        # 1. Orden de entrada a mercado
         client.futures_create_order(
             symbol   = symbol,
             side     = side,
@@ -281,23 +327,36 @@ def open_position(client: Client, signal: str, price: float, atr: float):
             quantity = qty
         )
 
+        # Pausa para que Binance registre la posición
         time.sleep(1)
         pos      = get_open_position(client)
         real_qty = abs(float(pos["positionAmt"])) if pos else qty
 
-        # Guardar SL/TP en estado interno — el bot los monitorea cada ciclo
+        # 2. Órdenes reales SL + TP en Binance
+        close_side = SIDE_SELL if signal == "LONG" else SIDE_BUY
+        sl_id, tp_id = place_sl_tp(client, close_side, sl_price, tp_price)
+
+        # 3. Guardar estado en memoria (monitoreo software de respaldo)
         state["sl_price"]    = sl_price
         state["tp_price"]    = tp_price
         state["signal"]      = signal
         state["entry_price"] = price
+        state["sl_order_id"] = sl_id
+        state["tp_order_id"] = tp_id
 
         balance = get_balance(client)
-        log.info(f"Posición {signal} abierta | SL={sl_price} TP={tp_price} (monitoreados por el bot)")
+        log.info(f"Posición {signal} abierta | SL={sl_price} TP={tp_price} | SL_id={sl_id} TP_id={tp_id}")
         tg_orden_abierta(signal, price, real_qty, sl_price, tp_price, balance)
 
     except BinanceAPIException as e:
         log.error(f"Error abriendo posición: {e}")
         tg_error(f"Error abriendo {signal}: {e}")
+        # Si la entrada se ejecutó pero los SL/TP fallaron → cerrar por seguridad
+        pos = get_open_position(client)
+        if pos:
+            log.warning("Entrada ejecutada pero SL/TP fallaron — cerrando por seguridad")
+            tg_error("Entrada sin SL/TP — cerrando por seguridad")
+            close_position(client, "fallo en SL/TP")
 
 
 def close_position(client: Client, motivo: str = "señal inversa"):
@@ -310,6 +369,8 @@ def close_position(client: Client, motivo: str = "señal inversa"):
     side = SIDE_SELL if amt > 0 else SIDE_BUY
 
     try:
+        # Cancelar órdenes SL/TP de Binance antes de cerrar con market
+        cancel_open_orders(client)
         client.futures_create_order(
             symbol     = CONFIG["symbol"],
             side       = side,
@@ -323,6 +384,28 @@ def close_position(client: Client, motivo: str = "señal inversa"):
     except BinanceAPIException as e:
         log.error(f"Error cerrando posición: {e}")
         tg_error(f"Error cerrando posición: {e}")
+
+
+def binance_orders_alive(client: Client) -> bool:
+    """
+    Verifica si las órdenes SL y TP siguen activas en Binance.
+    Si no están (ejecutadas o canceladas externamente), el software
+    de monitoreo toma el control.
+    """
+    if state["sl_order_id"] is None:
+        return False
+    try:
+        open_orders = client.futures_get_open_orders(symbol=CONFIG["symbol"])
+        ids = {o["orderId"] for o in open_orders}
+        sl_alive = state["sl_order_id"] in ids
+        tp_alive = state["tp_order_id"] in ids
+        if not sl_alive or not tp_alive:
+            log.warning(f"Órden(es) Binance ya no activas: SL={sl_alive} TP={tp_alive} — modo software activado")
+            return False
+        return True
+    except BinanceAPIException as e:
+        log.warning(f"No se pudo verificar órdenes abiertas: {e}")
+        return True  # asumir vivas ante duda
 
 
 def check_sl_tp(client: Client, current_price: float):
@@ -385,33 +468,44 @@ def run():
             # ── Precio actual (cada ciclo, para SL/TP) ──────────────────────
             current_price = get_current_price(client)
 
-            # ── Verificar SL/TP si hay posición ─────────────────────────────
+            # ── Leer posición una sola vez por ciclo ────────────────────────
             pos = get_open_position(client)
+
+            # ── Verificar SL/TP si hay posición ─────────────────────────────
             if pos and state["sl_price"] is not None:
-                check_sl_tp(client, current_price)
+                # Si las órdenes Binance ya no están (ejecutadas por el exchange
+                # o canceladas externamente), el monitoreo software toma el control
+                if not binance_orders_alive(client):
+                    check_sl_tp(client, current_price)
+                # Re-leer pos: alguna de las dos vías puede haber cerrado
+                pos = get_open_position(client)
+                # Si Binance ejecutó el SL/TP por su cuenta, limpiar estado
+                if not pos:
+                    log.info("Posición cerrada por Binance (SL/TP ejecutado)")
+                    clear_state()
             elif pos and state["sl_price"] is None:
                 # Posición abierta pero sin estado (ej: reinicio) → cerrar
                 log.warning("Posición sin SL/TP en memoria — cerrando por seguridad")
                 close_position(client, "sin SL/TP en memoria")
+                pos = None
 
             # ── Revisar señal cada CICLOS_POR_SENAL ciclos ──────────────────
             ciclos_senal += 1
             if ciclos_senal >= CICLOS_POR_SENAL:
                 ciclos_senal = 0
-                df     = get_klines(client)
-                price  = float(df.iloc[-1]["close"])
-                atr    = float(df.iloc[-1]["atr"])
-                ema_f  = round(float(df.iloc[-1]["ema_fast"]), 2)
-                ema_s  = round(float(df.iloc[-1]["ema_slow"]), 2)
-                rsi    = round(float(df.iloc[-1]["rsi"]), 1)
+                df    = get_klines(client)
+                price = float(df.iloc[-1]["close"])
+                atr   = float(df.iloc[-1]["atr"])
+                ema_f = round(float(df.iloc[-1]["ema_fast"]), 2)
+                ema_s = round(float(df.iloc[-1]["ema_slow"]), 2)
+                rsi   = round(float(df.iloc[-1]["rsi"]), 1)
                 signal = check_signal(df)
 
                 log.info(f"BTC=${price:.2f} | EMA9={ema_f} EMA21={ema_s} | RSI={rsi} | ATR={atr:.2f} | {signal}")
 
-                pos = get_open_position(client)
-
                 if signal != "NONE" and pos is None:
                     open_position(client, signal, price, atr)
+                    pos = get_open_position(client)  # actualizar tras apertura
 
                 elif signal != "NONE" and pos is not None:
                     amt = float(pos["positionAmt"])
@@ -419,9 +513,12 @@ def run():
                         log.info("Señal inversa → cerrando y reabriendo")
                         close_position(client, "señal inversa")
                         time.sleep(2)
-                        open_position(client, signal, price, atr)
+                        # Usar precio fresco para la nueva entrada
+                        fresh_price = get_current_price(client)
+                        open_position(client, signal, fresh_price, atr)
+                        pos = get_open_position(client)
 
-                # Heartbeat horario
+                # Heartbeat horario (usa pos actualizado)
                 ciclo += 1
                 if ciclo >= CONFIG["heartbeat_ciclos"]:
                     balance = get_balance(client)
@@ -429,8 +526,8 @@ def run():
                         amt       = float(pos["positionAmt"])
                         pnl       = float(pos.get("unrealizedProfit", 0))
                         direccion = "LONG 🟢" if amt > 0 else "SHORT 🔴"
-                        sl_txt    = f"SL: ${state['sl_price']:,.0f}" if state['sl_price'] else "—"
-                        tp_txt    = f"TP: ${state['tp_price']:,.0f}" if state['tp_price'] else "—"
+                        sl_txt    = f"SL: ${state['sl_price']:,.0f}" if state["sl_price"] else "—"
+                        tp_txt    = f"TP: ${state['tp_price']:,.0f}" if state["tp_price"] else "—"
                         pos_txt   = f"{direccion} | PnL: <code>${pnl:+.2f}</code>\n{sl_txt} · {tp_txt}"
                     else:
                         pos_txt = "Sin posición abierta"
