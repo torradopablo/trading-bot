@@ -276,7 +276,7 @@ def place_sl_tp(client: Client, close_side: str,
         side          = close_side,
         type          = "STOP_MARKET",
         stopPrice     = str(sl_price),
-        closePosition = True,
+        closePosition = "true",
         workingType   = "MARK_PRICE",
     )
     log.info(f"SL colocado en Binance — trigger={sl_price} id={sl_order['orderId']}")
@@ -286,7 +286,7 @@ def place_sl_tp(client: Client, close_side: str,
         side          = close_side,
         type          = "TAKE_PROFIT_MARKET",
         stopPrice     = str(tp_price),
-        closePosition = True,
+        closePosition = "true",
         workingType   = "MARK_PRICE",
     )
     log.info(f"TP colocado en Binance — trigger={tp_price} id={tp_order['orderId']}")
@@ -352,11 +352,15 @@ def open_position(client: Client, signal: str, price: float, atr: float):
         log.error(f"Error abriendo posición: {e}")
         tg_error(f"Error abriendo {signal}: {e}")
         # Si la entrada se ejecutó pero los SL/TP fallaron → cerrar por seguridad
-        pos = get_open_position(client)
-        if pos:
-            log.warning("Entrada ejecutada pero SL/TP fallaron — cerrando por seguridad")
-            tg_error("Entrada sin SL/TP — cerrando por seguridad")
-            close_position(client, "fallo en SL/TP")
+        try:
+            pos = get_open_position(client)
+            if pos:
+                log.warning("Entrada ejecutada pero SL/TP fallaron — cerrando por seguridad")
+                tg_error("Entrada sin SL/TP — cerrando por seguridad")
+                close_position(client, "fallo en SL/TP")
+        except Exception as fallback_err:
+            log.error(f"Error en fallback de cierre: {fallback_err}")
+            tg_error(f"Error crítico cerrando tras fallo SL/TP: {fallback_err}")
 
 
 def close_position(client: Client, motivo: str = "señal inversa"):
@@ -376,7 +380,7 @@ def close_position(client: Client, motivo: str = "señal inversa"):
             side       = side,
             type       = ORDER_TYPE_MARKET,
             quantity   = abs(amt),
-            reduceOnly = True
+            reduceOnly = "true"
         )
         log.info(f"Posición cerrada | motivo={motivo} | PnL={pnl:+.2f}")
         tg_orden_cerrada(motivo, pnl)
@@ -462,6 +466,9 @@ def run():
     # Separar contador de señales del de precio (precio cada 15s, señal cada 60s)
     ciclos_senal = 0
     CICLOS_POR_SENAL = max(1, 60 // CONFIG["loop_seconds"])  # cada 60s revisar señal
+
+    # Inicializar variables para que heartbeat no falle en primeros ciclos
+    price = ema_f = ema_s = rsi = 0
 
     while True:
         try:
