@@ -17,6 +17,8 @@ import logging
 import pathlib
 import requests
 from datetime import datetime
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import pandas as pd
 import pandas_ta as ta
@@ -170,11 +172,24 @@ def tg_error(msg: str):
 
 def get_client() -> Client:
     if CONFIG["testnet"]:
-        c = Client(API_KEY, API_SECRET, testnet=True)
+        c = Client(API_KEY, API_SECRET, testnet=True,
+                   requests_params={"timeout": 30})
         log.info("Conectado a TESTNET Binance Futures")
     else:
-        c = Client(API_KEY, API_SECRET)
+        c = Client(API_KEY, API_SECRET,
+                   requests_params={"timeout": 30})
         log.info("Conectado a Binance Futures REAL")
+
+    # Reintentos automáticos para errores de red transitorios
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,            # 1s, 2s, 4s entre reintentos
+        status_forcelist=[502, 503, 504],
+        allowed_methods=["GET", "POST", "DELETE"],
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    c.session.mount("https://", adapter)
+
     return c
 
 
