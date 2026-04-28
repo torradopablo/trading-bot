@@ -3,8 +3,8 @@ Binance Futures Bot — EMA 9/21 + RSI 14 + ATR Stop Loss
 Mercado: BTCUSDT Futures | Apalancamiento: 3x | Temporalidad: 15m
 Notificaciones: Telegram Bot
 
-SL/TP implementados con STOP y TAKE_PROFIT (con precio límite)
-compatibles con todas las cuentas Binance Futures.
+SL y TP manejados por el bot (sin órdenes condicionales de Binance).
+Compatible con todas las cuentas Binance Futures.
 
 Dependencias:
     pip install python-binance pandas pandas-ta requests
@@ -48,10 +48,8 @@ CONFIG = {
     "tp_atr_mult"     : 3.0,
     "risk_pct"        : 0.02,
     "testnet"         : False,
-    "loop_seconds"    : 60,
-    "heartbeat_ciclos": 60,
-    # Slippage para precio límite del SL (0.1% más holgado para que ejecute)
-    "sl_limit_slippage": 0.001,
+    "loop_seconds"    : 15,   # más frecuente para monitorear SL/TP
+    "heartbeat_ciclos": 240,  # cada 240 ciclos × 15s = ~1h
 }
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
@@ -65,6 +63,15 @@ logging.basicConfig(
     ]
 )
 log = logging.getLogger(__name__)
+
+# ─── ESTADO INTERNO (SL/TP en memoria) ───────────────────────────────────────
+
+state = {
+    "sl_price"  : None,
+    "tp_price"  : None,
+    "signal"    : None,   # "LONG" o "SHORT"
+    "entry_price": None,
+}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -102,16 +109,11 @@ def tg_bot_iniciado():
 
 def tg_orden_abierta(signal: str, price: float, qty: float,
                      sl: float, tp: float, balance: float):
-    if signal == "LONG":
-        emoji      = "🟢"
-        direccion  = "LONG  ▲"
-        riesgo_pct = round(abs(price - sl) / price * 100 * CONFIG["leverage"], 2)
-    else:
-        emoji      = "🔴"
-        direccion  = "SHORT ▼"
-        riesgo_pct = round(abs(sl - price) / price * 100 * CONFIG["leverage"], 2)
-    tp_pct = round(abs(tp - price) / price * 100 * CONFIG["leverage"], 2)
-    now    = datetime.now().strftime("%H:%M:%S")
+    emoji      = "🟢" if signal == "LONG" else "🔴"
+    direccion  = "LONG  ▲" if signal == "LONG" else "SHORT ▼"
+    riesgo_pct = round(abs(price - sl) / price * 100 * CONFIG["leverage"], 2)
+    tp_pct     = round(abs(tp - price) / price * 100 * CONFIG["leverage"], 2)
+    now        = datetime.now().strftime("%H:%M:%S")
     tg_send(
         f"{emoji} <b>ORDEN ABIERTA — {direccion}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -192,6 +194,11 @@ def get_klines(client: Client) -> pd.DataFrame:
     return df.dropna()
 
 
+def get_current_price(client: Client) -> float:
+    ticker = client.futures_symbol_ticker(symbol=CONFIG["symbol"])
+    return float(ticker["price"])
+
+
 def check_signal(df: pd.DataFrame) -> str:
     prev, curr = df.iloc[-2], df.iloc[-1]
     cross_up   = prev["ema_fast"] <= prev["ema_slow"] and curr["ema_fast"] > curr["ema_slow"]
@@ -215,14 +222,6 @@ def get_open_position(client: Client) -> dict | None:
     return None
 
 
-def cancel_open_orders(client: Client):
-    try:
-        client.futures_cancel_all_open_orders(symbol=CONFIG["symbol"])
-        log.info("Órdenes abiertas canceladas")
-    except BinanceAPIException as e:
-        log.warning(f"No se pudieron cancelar órdenes: {e}")
-
-
 def calc_qty(client: Client, atr: float, price: float) -> float:
     balance   = get_balance(client)
     risk_usdt = balance * CONFIG["risk_pct"]
@@ -242,59 +241,11 @@ def set_leverage(client: Client):
         pass
 
 
-def place_sl_tp(client: Client, close_side: str, qty: float,
-                sl_price: float, tp_price: float, signal: str):
-    """
-    Coloca SL y TP usando órdenes STOP (con precio límite) y TAKE_PROFIT
-    (con precio límite). Compatibles con todas las cuentas Binance Futures.
-
-    Para LONG:
-      SL = STOP sell:        stopPrice = sl,  price = sl * (1 - slippage)
-      TP = TAKE_PROFIT sell: stopPrice = tp,  price = tp * (1 - slippage)
-
-    Para SHORT:
-      SL = STOP buy:         stopPrice = sl,  price = sl * (1 + slippage)
-      TP = TAKE_PROFIT buy:  stopPrice = tp,  price = tp * (1 + slippage)
-
-    El slippage en el precio límite asegura que la orden se ejecute incluso
-    con pequeños gaps de precio, sin convertirse en market.
-    """
-    slip = CONFIG["sl_limit_slippage"]
-
-    if signal == "LONG":
-        sl_limit = round(sl_price * (1 - slip), 2)
-        tp_limit = round(tp_price * (1 - slip), 2)
-    else:
-        sl_limit = round(sl_price * (1 + slip), 2)
-        tp_limit = round(tp_price * (1 + slip), 2)
-
-    # ── Stop Loss ──────────────────────────────────────────────────────
-    client.futures_create_order(
-        symbol        = CONFIG["symbol"],
-        side          = close_side,
-        type          = "STOP",                  # STOP con precio límite
-        quantity      = qty,
-        price         = str(sl_limit),           # precio límite de ejecución
-        stopPrice     = str(sl_price),           # precio trigger
-        reduceOnly    = True,
-        timeInForce   = TIME_IN_FORCE_GTC,
-        workingType   = "MARK_PRICE",            # trigger por Mark Price (más estable)
-    )
-    log.info(f"SL colocado — trigger={sl_price} límite={sl_limit}")
-
-    # ── Take Profit ────────────────────────────────────────────────────
-    client.futures_create_order(
-        symbol        = CONFIG["symbol"],
-        side          = close_side,
-        type          = "TAKE_PROFIT",           # TAKE_PROFIT con precio límite
-        quantity      = qty,
-        price         = str(tp_limit),           # precio límite de ejecución
-        stopPrice     = str(tp_price),           # precio trigger
-        reduceOnly    = True,
-        timeInForce   = TIME_IN_FORCE_GTC,
-        workingType   = "MARK_PRICE",
-    )
-    log.info(f"TP colocado — trigger={tp_price} límite={tp_limit}")
+def clear_state():
+    state["sl_price"]    = None
+    state["tp_price"]    = None
+    state["signal"]      = None
+    state["entry_price"] = None
 
 
 def open_position(client: Client, signal: str, price: float, atr: float):
@@ -307,67 +258,58 @@ def open_position(client: Client, signal: str, price: float, atr: float):
         tg_error(msg)
         return
 
-    cancel_open_orders(client)
-
     sl_dist = atr * CONFIG["sl_atr_mult"]
     tp_dist = atr * CONFIG["tp_atr_mult"]
 
     if signal == "LONG":
-        side, close_side = SIDE_BUY,  SIDE_SELL
+        side     = SIDE_BUY
         sl_price = round(price - sl_dist, 2)
         tp_price = round(price + tp_dist, 2)
     else:
-        side, close_side = SIDE_SELL, SIDE_BUY
+        side     = SIDE_SELL
         sl_price = round(price + sl_dist, 2)
         tp_price = round(price - tp_dist, 2)
 
     log.info(f"Abriendo {signal} qty={qty} entry={price:.2f} SL={sl_price:.2f} TP={tp_price:.2f}")
 
     try:
-        # 1. Orden de entrada a mercado
-        entry = client.futures_create_order(
+        # Única orden necesaria: entrada a mercado
+        client.futures_create_order(
             symbol   = symbol,
             side     = side,
             type     = ORDER_TYPE_MARKET,
             quantity = qty
         )
-        log.info(f"Entrada ejecutada: orderId={entry.get('orderId')}")
 
-        # Pausa para que Binance registre la posición
         time.sleep(1)
-
-        # Cantidad real ejecutada
         pos      = get_open_position(client)
         real_qty = abs(float(pos["positionAmt"])) if pos else qty
 
-        # 2. SL + TP
-        place_sl_tp(client, close_side, real_qty, sl_price, tp_price, signal)
+        # Guardar SL/TP en estado interno — el bot los monitorea cada ciclo
+        state["sl_price"]    = sl_price
+        state["tp_price"]    = tp_price
+        state["signal"]      = signal
+        state["entry_price"] = price
 
         balance = get_balance(client)
-        log.info(f"Posición {signal} abierta OK con SL y TP")
+        log.info(f"Posición {signal} abierta | SL={sl_price} TP={tp_price} (monitoreados por el bot)")
         tg_orden_abierta(signal, price, real_qty, sl_price, tp_price, balance)
 
     except BinanceAPIException as e:
         log.error(f"Error abriendo posición: {e}")
         tg_error(f"Error abriendo {signal}: {e}")
-        # Si la entrada se ejecutó pero SL/TP fallaron → cerrar por seguridad
-        pos = get_open_position(client)
-        if pos:
-            log.warning("Entrada ejecutada pero SL/TP fallaron — cerrando por seguridad")
-            tg_error("Entrada sin SL/TP — cerrando por seguridad")
-            close_position(client, "fallo en SL/TP")
 
 
 def close_position(client: Client, motivo: str = "señal inversa"):
     pos = get_open_position(client)
     if not pos:
+        clear_state()
         return
     amt  = float(pos["positionAmt"])
     pnl  = float(pos.get("unrealizedProfit", 0))
     side = SIDE_SELL if amt > 0 else SIDE_BUY
 
     try:
-        cancel_open_orders(client)
         client.futures_create_order(
             symbol     = CONFIG["symbol"],
             side       = side,
@@ -377,9 +319,39 @@ def close_position(client: Client, motivo: str = "señal inversa"):
         )
         log.info(f"Posición cerrada | motivo={motivo} | PnL={pnl:+.2f}")
         tg_orden_cerrada(motivo, pnl)
+        clear_state()
     except BinanceAPIException as e:
         log.error(f"Error cerrando posición: {e}")
         tg_error(f"Error cerrando posición: {e}")
+
+
+def check_sl_tp(client: Client, current_price: float):
+    """
+    Monitorea SL y TP en cada ciclo.
+    Si el precio toca alguno, cierra la posición con orden de mercado.
+    """
+    if state["sl_price"] is None or state["tp_price"] is None:
+        return
+
+    signal   = state["signal"]
+    sl_price = state["sl_price"]
+    tp_price = state["tp_price"]
+
+    if signal == "LONG":
+        if current_price <= sl_price:
+            log.info(f"SL tocado | precio={current_price} SL={sl_price}")
+            close_position(client, f"🛑 Stop Loss (${current_price:,.2f})")
+        elif current_price >= tp_price:
+            log.info(f"TP tocado | precio={current_price} TP={tp_price}")
+            close_position(client, f"🎯 Take Profit (${current_price:,.2f})")
+
+    elif signal == "SHORT":
+        if current_price >= sl_price:
+            log.info(f"SL tocado | precio={current_price} SL={sl_price}")
+            close_position(client, f"🛑 Stop Loss (${current_price:,.2f})")
+        elif current_price <= tp_price:
+            log.info(f"TP tocado | precio={current_price} TP={tp_price}")
+            close_position(client, f"🎯 Take Profit (${current_price:,.2f})")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -396,45 +368,74 @@ def run():
 
     tg_bot_iniciado()
 
+    # Si el bot se reinicia con una posición abierta, recuperar estado de Binance
+    pos = get_open_position(client)
+    if pos:
+        log.warning("Posición abierta detectada al iniciar — no hay SL/TP en memoria.")
+        log.warning("Cerrando posición previa para empezar limpio.")
+        close_position(client, "reinicio del bot")
+
     ciclo = 0
+    # Separar contador de señales del de precio (precio cada 15s, señal cada 60s)
+    ciclos_senal = 0
+    CICLOS_POR_SENAL = max(1, 60 // CONFIG["loop_seconds"])  # cada 60s revisar señal
+
     while True:
         try:
-            df     = get_klines(client)
-            price  = float(df.iloc[-1]["close"])
-            atr    = float(df.iloc[-1]["atr"])
-            ema_f  = round(float(df.iloc[-1]["ema_fast"]), 2)
-            ema_s  = round(float(df.iloc[-1]["ema_slow"]), 2)
-            rsi    = round(float(df.iloc[-1]["rsi"]), 1)
-            signal = check_signal(df)
+            # ── Precio actual (cada ciclo, para SL/TP) ──────────────────────
+            current_price = get_current_price(client)
 
-            log.info(f"BTC=${price:.2f} | EMA9={ema_f} EMA21={ema_s} | RSI={rsi} | ATR={atr:.2f} | {signal}")
-
+            # ── Verificar SL/TP si hay posición ─────────────────────────────
             pos = get_open_position(client)
+            if pos and state["sl_price"] is not None:
+                check_sl_tp(client, current_price)
+            elif pos and state["sl_price"] is None:
+                # Posición abierta pero sin estado (ej: reinicio) → cerrar
+                log.warning("Posición sin SL/TP en memoria — cerrando por seguridad")
+                close_position(client, "sin SL/TP en memoria")
 
-            if signal != "NONE" and pos is None:
-                open_position(client, signal, price, atr)
+            # ── Revisar señal cada CICLOS_POR_SENAL ciclos ──────────────────
+            ciclos_senal += 1
+            if ciclos_senal >= CICLOS_POR_SENAL:
+                ciclos_senal = 0
+                df     = get_klines(client)
+                price  = float(df.iloc[-1]["close"])
+                atr    = float(df.iloc[-1]["atr"])
+                ema_f  = round(float(df.iloc[-1]["ema_fast"]), 2)
+                ema_s  = round(float(df.iloc[-1]["ema_slow"]), 2)
+                rsi    = round(float(df.iloc[-1]["rsi"]), 1)
+                signal = check_signal(df)
 
-            elif signal != "NONE" and pos is not None:
-                amt = float(pos["positionAmt"])
-                if (signal == "LONG" and amt < 0) or (signal == "SHORT" and amt > 0):
-                    log.info("Señal inversa → cerrando y reabriendo")
-                    close_position(client, "señal inversa")
-                    time.sleep(2)
+                log.info(f"BTC=${price:.2f} | EMA9={ema_f} EMA21={ema_s} | RSI={rsi} | ATR={atr:.2f} | {signal}")
+
+                pos = get_open_position(client)
+
+                if signal != "NONE" and pos is None:
                     open_position(client, signal, price, atr)
 
-            # Heartbeat horario
-            ciclo += 1
-            if ciclo >= CONFIG["heartbeat_ciclos"]:
-                balance = get_balance(client)
-                if pos:
-                    amt       = float(pos["positionAmt"])
-                    pnl       = float(pos.get("unrealizedProfit", 0))
-                    direccion = "LONG 🟢" if amt > 0 else "SHORT 🔴"
-                    pos_txt   = f"{direccion} | PnL: <code>${pnl:+.2f}</code>"
-                else:
-                    pos_txt = "Sin posición abierta"
-                tg_heartbeat(price, ema_f, ema_s, rsi, pos_txt, balance)
-                ciclo = 0
+                elif signal != "NONE" and pos is not None:
+                    amt = float(pos["positionAmt"])
+                    if (signal == "LONG" and amt < 0) or (signal == "SHORT" and amt > 0):
+                        log.info("Señal inversa → cerrando y reabriendo")
+                        close_position(client, "señal inversa")
+                        time.sleep(2)
+                        open_position(client, signal, price, atr)
+
+                # Heartbeat horario
+                ciclo += 1
+                if ciclo >= CONFIG["heartbeat_ciclos"]:
+                    balance = get_balance(client)
+                    if pos:
+                        amt       = float(pos["positionAmt"])
+                        pnl       = float(pos.get("unrealizedProfit", 0))
+                        direccion = "LONG 🟢" if amt > 0 else "SHORT 🔴"
+                        sl_txt    = f"SL: ${state['sl_price']:,.0f}" if state['sl_price'] else "—"
+                        tp_txt    = f"TP: ${state['tp_price']:,.0f}" if state['tp_price'] else "—"
+                        pos_txt   = f"{direccion} | PnL: <code>${pnl:+.2f}</code>\n{sl_txt} · {tp_txt}"
+                    else:
+                        pos_txt = "Sin posición abierta"
+                    tg_heartbeat(price, ema_f, ema_s, rsi, pos_txt, balance)
+                    ciclo = 0
 
         except BinanceAPIException as e:
             log.error(f"Binance API error: {e}")
