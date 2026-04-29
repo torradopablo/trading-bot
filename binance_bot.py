@@ -292,7 +292,7 @@ def cancel_open_orders(client: Client):
     if _use_conditional_endpoint:
         try:
             client._request_futures_api(
-                'delete', 'conditional/allOpenOrders',
+                'delete', 'algoOpenOrders',
                 signed=True, data={"symbol": CONFIG["symbol"]}
             )
             log.info("Órdenes condicionales canceladas")
@@ -305,12 +305,18 @@ _use_conditional_endpoint = False   # se activa si la cuenta requiere Algo Order
 
 def _create_conditional_order(client: Client, **params) -> dict:
     """
-    Llama al endpoint /fapi/v1/conditional/order (Algo Order API)
+    Llama al endpoint /fapi/v1/algoOrder (Algo Order API)
     para cuentas que no soportan STOP_MARKET/TAKE_PROFIT_MARKET
     en el endpoint estándar /fapi/v1/order (error -4120).
     """
-    return client._request_futures_api('post', 'conditional/order',
-                                       signed=True, data=params)
+    params["algoType"] = "CONDITIONAL"
+    res = client._request_futures_api('post', 'algoOrder',
+                                      signed=True, data=params)
+    
+    # Binance devuelve algoId, lo mapeamos a orderId para compatibilidad interna
+    if isinstance(res, dict) and "algoId" in res and "orderId" not in res:
+        res["orderId"] = res["algoId"]
+    return res
 
 
 def _place_single_order(client: Client, order_type: str,
@@ -336,7 +342,7 @@ def _place_single_order(client: Client, order_type: str,
             return client.futures_create_order(**params)
         except BinanceAPIException as e:
             if e.code == -4120:
-                log.warning("Endpoint estándar no soportado → cambiando a conditional/order")
+                log.warning("Endpoint estándar no soportado → cambiando a algoOrder")
                 _use_conditional_endpoint = True
             else:
                 raise
@@ -480,10 +486,20 @@ def binance_orders_alive(client: Client) -> bool:
         if _use_conditional_endpoint:
             try:
                 cond_orders = client._request_futures_api(
-                    'get', 'conditional/openOrders',
+                    'get', 'openAlgoOrders',
                     signed=True, data={"symbol": CONFIG["symbol"]}
                 )
-                ids.update(o["orderId"] for o in cond_orders)
+                # Formato: puede ser una lista de dicts o {"total": X, "orders": [...]}
+                if isinstance(cond_orders, dict) and "orders" in cond_orders:
+                    cond_list = cond_orders["orders"]
+                elif isinstance(cond_orders, list):
+                    cond_list = cond_orders
+                elif isinstance(cond_orders, dict) and "algoId" in cond_orders:
+                    cond_list = [cond_orders]
+                else:
+                    cond_list = []
+                    
+                ids.update(o.get("algoId", o.get("orderId")) for o in cond_list if "algoId" in o or "orderId" in o)
             except BinanceAPIException:
                 pass  # si falla, verificar con lo que tenemos
 
