@@ -257,7 +257,8 @@ def calc_qty(client: Client, atr: float, price: float) -> float:
     stop_dist = atr * CONFIG["sl_atr_mult"]
     qty_risk  = risk_usdt / stop_dist
     qty_max   = (balance * CONFIG["leverage"] * 0.95) / price
-    return round(min(qty_risk, qty_max), 3)
+    import math
+    return math.floor(min(qty_risk, qty_max) * 1000) / 1000.0
 
 
 def set_leverage(client: Client):
@@ -309,6 +310,9 @@ def _create_conditional_order(client: Client, **params) -> dict:
     para cuentas que no soportan STOP_MARKET/TAKE_PROFIT_MARKET
     en el endpoint estándar /fapi/v1/order (error -4120).
     """
+    if "stopPrice" in params:
+        params["triggerPrice"] = params.pop("stopPrice")
+
     params["algoType"] = "CONDITIONAL"
     res = client._request_futures_api('post', 'algoOrder',
                                       signed=True, data=params)
