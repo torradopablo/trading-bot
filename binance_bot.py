@@ -281,41 +281,87 @@ def clear_state():
 
 
 def cancel_open_orders(client: Client):
+    # Cancelar órdenes estándar
     try:
         client.futures_cancel_all_open_orders(symbol=CONFIG["symbol"])
-        log.info("Órdenes condicionales canceladas")
+        log.info("Órdenes estándar canceladas")
     except BinanceAPIException as e:
-        log.warning(f"No se pudieron cancelar órdenes: {e}")
+        log.warning(f"No se pudieron cancelar órdenes estándar: {e}")
+
+    # Cancelar órdenes condicionales (Algo Order API) si se usó ese endpoint
+    if _use_conditional_endpoint:
+        try:
+            client._request_futures_api(
+                'delete', 'conditional/allOpenOrders',
+                signed=True, data={"symbol": CONFIG["symbol"]}
+            )
+            log.info("Órdenes condicionales canceladas")
+        except BinanceAPIException as e:
+            log.warning(f"No se pudieron cancelar órdenes condicionales: {e}")
+
+
+_use_conditional_endpoint = False   # se activa si la cuenta requiere Algo Order API
+
+
+def _create_conditional_order(client: Client, **params) -> dict:
+    """
+    Llama al endpoint /fapi/v1/conditional/order (Algo Order API)
+    para cuentas que no soportan STOP_MARKET/TAKE_PROFIT_MARKET
+    en el endpoint estándar /fapi/v1/order (error -4120).
+    """
+    return client._request_futures_api('post', 'conditional/order',
+                                       signed=True, data=params)
+
+
+def _place_single_order(client: Client, order_type: str,
+                        close_side: str, stop_price: float) -> dict:
+    """
+    Intenta colocar una orden condicional.  Si la cuenta no soporta
+    el endpoint estándar (error -4120), usa el endpoint condicional
+    y lo recuerda para futuras órdenes.
+    """
+    global _use_conditional_endpoint
+
+    params = dict(
+        symbol        = CONFIG["symbol"],
+        side          = close_side,
+        type          = order_type,
+        stopPrice     = str(stop_price),
+        closePosition = "true",
+        workingType   = "MARK_PRICE",
+    )
+
+    if not _use_conditional_endpoint:
+        try:
+            return client.futures_create_order(**params)
+        except BinanceAPIException as e:
+            if e.code == -4120:
+                log.warning("Endpoint estándar no soportado → cambiando a conditional/order")
+                _use_conditional_endpoint = True
+            else:
+                raise
+
+    # Endpoint condicional (Algo Order API)
+    return _create_conditional_order(client, **params)
 
 
 def place_sl_tp(client: Client, close_side: str,
                 sl_price: float, tp_price: float):
     """
     Coloca órdenes reales de SL y TP en Binance usando STOP_MARKET y
-    TAKE_PROFIT_MARKET, que son aceptadas por el endpoint estándar
-    /fapi/v1/order (sin error -4120).
+    TAKE_PROFIT_MARKET.
+
+    Intenta primero el endpoint estándar /fapi/v1/order.  Si la cuenta
+    devuelve -4120, cambia al endpoint /fapi/v1/conditional/order
+    (Algo Order API) automáticamente.
 
     closePosition=True  → Binance cierra toda la posición al dispararse.
     workingType=MARK_PRICE → trigger por Mark Price (evita wick-outs).
     """
-    sl_order = client.futures_create_order(
-        symbol        = CONFIG["symbol"],
-        side          = close_side,
-        type          = "STOP_MARKET",
-        stopPrice     = str(sl_price),
-        closePosition = "true",
-        workingType   = "MARK_PRICE",
-    )
+    sl_order = _place_single_order(client, "STOP_MARKET", close_side, sl_price)
     log.info(f"SL colocado en Binance — trigger={sl_price} id={sl_order['orderId']}")
 
-    tp_order = client.futures_create_order(
-        symbol        = CONFIG["symbol"],
-        side          = close_side,
-        type          = "TAKE_PROFIT_MARKET",
-        stopPrice     = str(tp_price),
-        closePosition = "true",
-        workingType   = "MARK_PRICE",
-    )
+    tp_order = _place_single_order(client, "TAKE_PROFIT_MARKET", close_side, tp_price)
     log.info(f"TP colocado en Binance — trigger={tp_price} id={tp_order['orderId']}")
 
     return sl_order["orderId"], tp_order["orderId"]
@@ -427,8 +473,20 @@ def binance_orders_alive(client: Client) -> bool:
     if state["sl_order_id"] is None:
         return False
     try:
+        # Recopilar IDs de órdenes abiertas (estándar + condicionales)
         open_orders = client.futures_get_open_orders(symbol=CONFIG["symbol"])
         ids = {o["orderId"] for o in open_orders}
+
+        if _use_conditional_endpoint:
+            try:
+                cond_orders = client._request_futures_api(
+                    'get', 'conditional/openOrders',
+                    signed=True, data={"symbol": CONFIG["symbol"]}
+                )
+                ids.update(o["orderId"] for o in cond_orders)
+            except BinanceAPIException:
+                pass  # si falla, verificar con lo que tenemos
+
         sl_alive = state["sl_order_id"] in ids
         tp_alive = state["tp_order_id"] in ids
         if not sl_alive or not tp_alive:
