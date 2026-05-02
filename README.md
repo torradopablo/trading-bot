@@ -4,19 +4,24 @@ Este es un bot de trading automático para **Binance Futures** (BTCUSDT por defe
 
 ## 📊 Estrategia de Trading
 
-El bot opera bajo una estrategia tendencial con filtros de momentum y gestión de riesgo dinámica:
+El bot opera bajo una estrategia tendencial (Trend Following) muy robusta, aplicando múltiples filtros para evitar mercados laterales y operando con medidas anti-repainting (usando únicamente velas confirmadas por cierre):
 
-1.  **Cruce de EMAs (9/21)**: Determina la dirección de la tendencia. 
-    *   **LONG**: Cuando la EMA 9 cruza hacia arriba la EMA 21.
-    *   **SHORT**: Cuando la EMA 9 cruza hacia abajo la EMA 21.
-2.  **Filtro RSI (14)**: Evita entrar en posiciones cuando el mercado está en niveles extremos.
-    *   Para **LONG**: El RSI debe ser menor a 70 (no sobrecomprado).
-    *   Para **SHORT**: El RSI debe ser mayor a 30 (no sobrevendido).
-3.  **Gestión de Riesgo (ATR)**:
-    *   **Stop Loss (SL)**: Se sitúa a 1.5 * ATR del precio de entrada.
-    *   **Take Profit (TP)**: Se sitúa a 3.0 * ATR del precio de entrada (Ratio Riesgo/Beneficio 1:2).
-    *   **Riesgo por trade**: Calcula automáticamente el tamaño de la posición para arriesgar solo el 2% del balance disponible.
-    *   **Apalancamiento**: Configurado por defecto en 3x.
+1.  **Directriz Principal (EMA 200)**: No se abre ninguna operación que vaya en contra del macro-movimiento.
+    *   Solo se permiten compras (**LONG**) si el precio de cierre está **por encima** de la EMA de 200.
+    *   Solo se permiten ventas (**SHORT**) si el precio de cierre está **por debajo** de la EMA de 200.
+2.  **Gatillo de Entrada (EMAs 9 y 21)**: Determina el instante exacto de nuestro giro en temporalidad local.
+    *   **LONG**: Cuando la EMA rápida (9) cruza limpiamente hacia arriba la EMA lenta (21).
+    *   **SHORT**: Cuando la EMA rápida (9) cruza limpiamente hacia abajo la EMA lenta (21).
+3.  **Fuerza Adicional (ADX 14)**:
+    *   Filtro estricto que exige un valor de **ADX > 20** para asegurar que el mercado lleva direccionalidad, evitando así descapitalizarse en zonas de acumulación (falsos cruces por precio lateral / choppiness).
+4.  **Filtro Momentum (RSI 14)**: Evita compras en el final del recorrido (pico superior) o ventas en el suelo.
+    *   Para **LONG**: RSI < 70 (debe haber margen de subida sin estar sobrecomprado).
+    *   Para **SHORT**: RSI > 30 (debe haber margen de caída sin estar sobrevendido).
+5.  **Gestión Dinámica de Riesgo (ATR 14)**:
+    *   **Stop Loss (SL)**: A una distancia de 1.5 × ATR desde el precio de entrada, adaptándose pasivamente a la volatilidad del mercado en ese momento.
+    *   **Take Profit (TP)**: A una distancia de 3.0 × ATR, persiguiendo un ratio Riesgo/Beneficio ideal asimétrico de 1:2.
+    *   **Riesgo estricto por trade**: Arriesga topado en pérdida exactamente el 2% de tu balance disponible computando automáticamente la cantidad a comprar/vender.
+    *   **Apalancamiento base**: 3x como configuración estándar para el bot.
 
 ## 🚀 Requisitos Previos
 

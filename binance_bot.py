@@ -110,7 +110,7 @@ def tg_bot_iniciado():
         f"📌 Par: <code>{CONFIG['symbol']}</code>\n"
         f"⚡ Apalancamiento: <b>{CONFIG['leverage']}x</b>\n"
         f"⏱ Temporalidad: <b>15m</b>\n"
-        f"📐 Estrategia: EMA 9/21 · RSI 14 · ATR SL\n"
+        f"📐 Estrategia: EMA 9/21/200 · RSI 14 · ADX 14 · ATR SL\n"
         f"🌐 Modo: {modo}"
     )
 
@@ -151,16 +151,16 @@ def tg_orden_cerrada(motivo: str, pnl: float | None = None):
     )
 
 
-def tg_heartbeat(price: float, ema_f: float, ema_s: float,
-                 rsi: float, atr: float, pos_txt: str,
+def tg_heartbeat(price: float, ema_f: float, ema_s: float, ema_trend: float,
+                 rsi: float, atr: float, adx: float, pos_txt: str,
                  balance_available: float, balance_total: float):
     now = datetime.now().strftime("%d/%m %H:%M")
     tg_send(
         f"📊 <b>Resumen 20min</b>  <i>{now}</i>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"💵 Precio: <b>${price:,.2f}</b>\n"
-        f"📈 EMA9: <code>{ema_f}</code>  EMA21: <code>{ema_s}</code>\n"
-        f"📉 RSI: <code>{rsi}</code>  ATR: <code>{atr}</code>\n"
+        f"📈 EMA9: <code>{ema_f}</code> EMA21: <code>{ema_s}</code> EMA200: <code>{ema_trend}</code>\n"
+        f"📉 RSI: <code>{rsi}</code>  ATR: <code>{atr}</code>  ADX: <code>{adx}</code>\n"
         f"📂 Posición: {pos_txt}\n"
         f"💰 Disponible: <code>${balance_available:,.2f}</code>\n"
         f"💼 Total: <code>${balance_total:,.2f} USDT</code>"
@@ -215,6 +215,14 @@ def get_klines(client: Client) -> pd.DataFrame:
     df["ema_trend"] = ta.ema(df["close"], length=CONFIG["ema_trend"])
     df["rsi"]      = ta.rsi(df["close"], length=CONFIG["rsi_period"])
     df["atr"]      = ta.atr(df["high"], df["low"], df["close"], length=CONFIG["atr_period"])
+    
+    # NUEVO: ADX para medir la fuerza de la tendencia
+    adx_df = ta.adx(df["high"], df["low"], df["close"], length=14)
+    if adx_df is not None:
+        df["adx"] = adx_df["ADX_14"]
+    else:
+        df["adx"] = 0
+        
     return df.dropna()
 
 
@@ -224,10 +232,13 @@ def get_current_price(client: Client) -> float:
 
 
 def check_signal(df: pd.DataFrame) -> str:
-    if len(df) < 2: return "NONE"
-    prev, curr = df.iloc[-2], df.iloc[-1]
+    # EVITAR REPAINTING: df.iloc[-1] es la vela abierta.
+    # Usamos df.iloc[-2] que es la última vela confirmada y cerrada.
+    if len(df) < 3: return "NONE"
     
-    # 1. Disparo: Cruce de EMAs Rápidas
+    prev, curr = df.iloc[-3], df.iloc[-2]
+    
+    # 1. Disparo: Cruce de EMAs Rápidas confirmado al cierre de la vela
     cross_up   = prev["ema_fast"] <= prev["ema_slow"] and curr["ema_fast"] > curr["ema_slow"]
     cross_down = prev["ema_fast"] >= prev["ema_slow"] and curr["ema_fast"] < curr["ema_slow"]
     
@@ -239,8 +250,11 @@ def check_signal(df: pd.DataFrame) -> str:
     rsi_long  = 50 < curr["rsi"] < CONFIG["rsi_overbought"]
     rsi_short = 50 > curr["rsi"] > CONFIG["rsi_oversold"]
 
-    if cross_up   and uptrend   and rsi_long:  return "LONG"
-    if cross_down and downtrend and rsi_short: return "SHORT"
+    # 4. Filtro 3 (Fuerza de la Tendencia - ADX): Confirmar si la tendencia es fuerte
+    adx_strong = curr.get("adx", 0) > 20
+
+    if cross_up   and uptrend   and rsi_long  and adx_strong: return "LONG"
+    if cross_down and downtrend and rsi_short and adx_strong: return "SHORT"
     
     return "NONE"
 
@@ -591,7 +605,7 @@ def run():
     MAX_ERRORES_RECONEXION = 5
 
     # Inicializar variables para que heartbeat no falle en primeros ciclos
-    price = ema_f = ema_s = rsi = atr_val = 0
+    price = ema_f = ema_s = ema_t = rsi = atr_val = adx_val = 0
     indicadores_listos = False
 
     while True:
@@ -628,15 +642,17 @@ def run():
             if ciclos_senal >= CICLOS_POR_SENAL:
                 ciclos_senal = 0
                 df      = get_klines(client)
-                price   = float(df.iloc[-1]["close"])
-                atr_val = float(df.iloc[-1]["atr"])
-                ema_f   = round(float(df.iloc[-1]["ema_fast"]), 2)
-                ema_s   = round(float(df.iloc[-1]["ema_slow"]), 2)
-                rsi     = round(float(df.iloc[-1]["rsi"]), 1)
+                price   = current_price  # Precio real de mercado actual
+                atr_val = float(df.iloc[-2]["atr"])
+                ema_f   = round(float(df.iloc[-2]["ema_fast"]), 2)
+                ema_s   = round(float(df.iloc[-2]["ema_slow"]), 2)
+                ema_t   = round(float(df.iloc[-2]["ema_trend"]), 2)
+                rsi     = round(float(df.iloc[-2]["rsi"]), 1)
+                adx_val = round(float(df.iloc[-2].get("adx", 0)), 1)
                 signal  = check_signal(df)
                 indicadores_listos = True
 
-                log.info(f"BTC=${price:.2f} | EMA9={ema_f} EMA21={ema_s} | RSI={rsi} | ATR={atr_val:.2f} | {signal}")
+                log.info(f"BTC=${price:.2f} | EMA9={ema_f} EMA21={ema_s} EMA200={ema_t} | RSI={rsi} | ATR={atr_val:.2f} | ADX={adx_val} | {signal}")
 
                 if signal != "NONE" and pos is None:
                     open_position(client, signal, price, atr_val)
@@ -674,8 +690,8 @@ def run():
                     pos_txt   = f"{direccion} | PnL: <code>${pnl:+.2f}</code>\n{sl_txt} · {tp_txt}{dur_txt}"
                 else:
                     pos_txt = "Sin posición abierta"
-                tg_heartbeat(price, ema_f, ema_s, rsi,
-                             round(atr_val, 2), pos_txt,
+                tg_heartbeat(price, ema_f, ema_s, ema_t, rsi,
+                             round(atr_val, 2), adx_val, pos_txt,
                              bal_available, bal_total)
                 ciclo_heartbeat = 0
 
