@@ -44,6 +44,7 @@ CONFIG = {
     "leverage"        : 3,
     "ema_fast"        : 9,
     "ema_slow"        : 21,
+    "ema_trend"       : 200,  # <-- NUEVO: Filtro agresivo contra 'rangos'
     "rsi_period"      : 14,
     "rsi_overbought"  : 70,
     "rsi_oversold"    : 30,
@@ -201,7 +202,7 @@ def get_klines(client: Client) -> pd.DataFrame:
     raw = client.futures_klines(
         symbol=CONFIG["symbol"],
         interval=CONFIG["interval"],
-        limit=100
+        limit=250  # <-- Incrementado a 250 para poder calcular EMA 200 bien
     )
     df = pd.DataFrame(raw, columns=[
         "open_time","open","high","low","close","volume",
@@ -211,6 +212,7 @@ def get_klines(client: Client) -> pd.DataFrame:
         df[col] = df[col].astype(float)
     df["ema_fast"] = ta.ema(df["close"], length=CONFIG["ema_fast"])
     df["ema_slow"] = ta.ema(df["close"], length=CONFIG["ema_slow"])
+    df["ema_trend"] = ta.ema(df["close"], length=CONFIG["ema_trend"])
     df["rsi"]      = ta.rsi(df["close"], length=CONFIG["rsi_period"])
     df["atr"]      = ta.atr(df["high"], df["low"], df["close"], length=CONFIG["atr_period"])
     return df.dropna()
@@ -222,11 +224,24 @@ def get_current_price(client: Client) -> float:
 
 
 def check_signal(df: pd.DataFrame) -> str:
+    if len(df) < 2: return "NONE"
     prev, curr = df.iloc[-2], df.iloc[-1]
+    
+    # 1. Disparo: Cruce de EMAs Rápidas
     cross_up   = prev["ema_fast"] <= prev["ema_slow"] and curr["ema_fast"] > curr["ema_slow"]
     cross_down = prev["ema_fast"] >= prev["ema_slow"] and curr["ema_fast"] < curr["ema_slow"]
-    if cross_up   and curr["rsi"] < CONFIG["rsi_overbought"]: return "LONG"
-    if cross_down and curr["rsi"] > CONFIG["rsi_oversold"]:   return "SHORT"
+    
+    # 2. Filtro 1 (Tendencia Mayor): Estar del lado de la EMA 200
+    uptrend   = curr["close"] > curr["ema_trend"]
+    downtrend = curr["close"] < curr["ema_trend"]
+
+    # 3. Filtro 2 (Momentum RSI): Esperar momentum antes de entrar (evita zonas planas)
+    rsi_long  = 50 < curr["rsi"] < CONFIG["rsi_overbought"]
+    rsi_short = 50 > curr["rsi"] > CONFIG["rsi_oversold"]
+
+    if cross_up   and uptrend   and rsi_long:  return "LONG"
+    if cross_down and downtrend and rsi_short: return "SHORT"
+    
     return "NONE"
 
 
