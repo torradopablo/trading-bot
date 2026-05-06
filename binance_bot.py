@@ -231,6 +231,29 @@ def get_current_price(client: Client) -> float:
     return float(ticker["price"])
 
 
+def get_trend_bias(client: Client) -> str:
+    try:
+        raw = client.futures_klines(
+            symbol=CONFIG["symbol"],
+            interval=Client.KLINE_INTERVAL_1HOUR,
+            limit=60
+        )
+        df = pd.DataFrame(raw, columns=[
+            "open_time","open","high","low","close","volume",
+            "close_time","qav","trades","tbbav","tbqav","ignore"
+        ])
+        df["close"] = df["close"].astype(float)
+        ema_50 = ta.ema(df["close"], length=50).iloc[-2]
+        price  = float(df["close"].iloc[-2])
+        
+        if price > ema_50 * 1.001:   return "BULL"
+        if price < ema_50 * 0.999:   return "BEAR"
+        return "NEUTRAL"
+    except Exception as e:
+        log.warning(f"Error obteniendo bias de 1h: {e}")
+        return "NEUTRAL"
+
+
 def check_signal(df: pd.DataFrame) -> str:
     # EVITAR REPAINTING: df.iloc[-1] es la vela abierta.
     # Usamos df.iloc[-2] que es la última vela confirmada y cerrada.
@@ -247,14 +270,44 @@ def check_signal(df: pd.DataFrame) -> str:
     downtrend = curr["close"] < curr["ema_trend"]
 
     # 3. Filtro 2 (Momentum RSI): Esperar momentum antes de entrar (evita zonas planas)
-    rsi_long  = 50 < curr["rsi"] < CONFIG["rsi_overbought"]
-    rsi_short = 50 > curr["rsi"] > CONFIG["rsi_oversold"]
+    rsi_long  = curr["rsi"] > 45
+    rsi_short = curr["rsi"] < 55
 
     # 4. Filtro 3 (Fuerza de la Tendencia - ADX): Confirmar si la tendencia es fuerte
-    adx_strong = curr.get("adx", 0) > 20
+    adx_values = df["adx"].iloc[-10:].mean()
+    adx_threshold = max(18, min(25, adx_values * 0.85))
+    adx_strong = curr.get("adx", 0) > adx_threshold
 
     if cross_up   and uptrend   and rsi_long  and adx_strong: return "LONG"
     if cross_down and downtrend and rsi_short and adx_strong: return "SHORT"
+    
+    return "NONE"
+
+
+def check_signal_pullback(df: pd.DataFrame) -> str:
+    if len(df) < 3: return "NONE"
+    
+    prev, curr = df.iloc[-3], df.iloc[-2]
+    
+    ema_bullish = curr["ema_fast"] > curr["ema_slow"]
+    ema_bearish = curr["ema_fast"] < curr["ema_slow"]
+    
+    pullback_long  = (prev["low"]  <= prev["ema_slow"] and 
+                      curr["close"] > curr["ema_slow"] and
+                      ema_bullish)
+    pullback_short = (prev["high"] >= prev["ema_slow"] and 
+                      curr["close"] < curr["ema_slow"] and
+                      ema_bearish)
+    
+    uptrend   = curr["close"] > curr["ema_trend"]
+    downtrend = curr["close"] < curr["ema_trend"]
+    
+    adx_values = df["adx"].iloc[-10:].mean()
+    adx_threshold = max(18, min(25, adx_values * 0.85))
+    adx_ok = curr.get("adx", 0) > adx_threshold
+
+    if pullback_long  and uptrend   and curr["rsi"] > 45 and adx_ok: return "LONG"
+    if pullback_short and downtrend and curr["rsi"] < 55 and adx_ok: return "SHORT"
     
     return "NONE"
 
@@ -547,6 +600,51 @@ def binance_orders_alive(client: Client) -> bool:
         return True  # asumir vivas ante duda
 
 
+def _update_sl_on_binance(client: Client, new_sl: float):
+    try:
+        if state["sl_order_id"]:
+            client.futures_cancel_order(
+                symbol=CONFIG["symbol"], 
+                orderId=state["sl_order_id"]
+            )
+        close_side = SIDE_SELL if state["signal"] == "LONG" else SIDE_BUY
+        sl_order = _place_single_order(client, "STOP_MARKET", close_side, new_sl)
+        state["sl_order_id"] = sl_order["orderId"]
+    except BinanceAPIException as e:
+        log.warning(f"Error actualizando trailing SL: {e}")
+
+
+def update_trailing_sl(client: Client, current_price: float):
+    if state["signal"] is None or state["entry_price"] is None or state["sl_price"] is None:
+        return
+    
+    entry = state["entry_price"]
+    sl    = state["sl_price"]
+    atr_approx = abs(entry - sl) / CONFIG["sl_atr_mult"]
+    if atr_approx == 0:
+        return
+        
+    if state["signal"] == "LONG":
+        profit_atr = (current_price - entry) / atr_approx
+        if profit_atr >= 1.0:
+            new_sl = max(sl, current_price - atr_approx * CONFIG["sl_atr_mult"])
+            new_sl = round(new_sl, 2)
+            if new_sl > sl:
+                log.info(f"Trailing SL actualizado: {sl} → {new_sl}")
+                state["sl_price"] = new_sl
+                _update_sl_on_binance(client, new_sl)
+
+    elif state["signal"] == "SHORT":
+        profit_atr = (entry - current_price) / atr_approx
+        if profit_atr >= 1.0:
+            new_sl = min(sl, current_price + atr_approx * CONFIG["sl_atr_mult"])
+            new_sl = round(new_sl, 2)
+            if new_sl < sl:
+                log.info(f"Trailing SL actualizado: {sl} → {new_sl}")
+                state["sl_price"] = new_sl
+                _update_sl_on_binance(client, new_sl)
+
+
 def check_sl_tp(client: Client, current_price: float):
     """
     Monitorea SL y TP en cada ciclo.
@@ -621,6 +719,7 @@ def run():
 
             # ── Verificar SL/TP si hay posición ─────────────────────────────
             if pos and state["sl_price"] is not None:
+                update_trailing_sl(client, current_price)
                 # Si las órdenes Binance ya no están (ejecutadas por el exchange
                 # o canceladas externamente), el monitoreo software toma el control
                 if not binance_orders_alive(client):
@@ -649,10 +748,18 @@ def run():
                 ema_t   = round(float(df.iloc[-2]["ema_trend"]), 2)
                 rsi     = round(float(df.iloc[-2]["rsi"]), 1)
                 adx_val = round(float(df.iloc[-2].get("adx", 0)), 1)
-                signal  = check_signal(df)
+                
+                signal = check_signal(df)
+                if signal == "NONE":
+                    signal = check_signal_pullback(df)
+                
+                trend_bias = get_trend_bias(client)
+                if signal == "LONG" and trend_bias == "BEAR": signal = "NONE"
+                if signal == "SHORT" and trend_bias == "BULL": signal = "NONE"
+
                 indicadores_listos = True
 
-                log.info(f"BTC=${price:.2f} | EMA9={ema_f} EMA21={ema_s} EMA200={ema_t} | RSI={rsi} | ATR={atr_val:.2f} | ADX={adx_val} | {signal}")
+                log.info(f"BTC=${price:.2f} | EMA9={ema_f} EMA21={ema_s} EMA200={ema_t} | RSI={rsi} | ATR={atr_val:.2f} | ADX={adx_val} | 1h_Bias={trend_bias} | {signal}")
 
                 if signal != "NONE" and pos is None:
                     open_position(client, signal, price, atr_val)
